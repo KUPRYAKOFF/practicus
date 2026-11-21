@@ -1,7 +1,7 @@
 import {createHash} from 'node:crypto';
 import {readFile,readdir} from 'node:fs/promises';
 import vm from 'node:vm';
-export function validateTag(ref,version){if(ref!=='v'+version)throw new Error('Release tag must match package version: v'+version);}
+export function validateTag(ref,version){if(ref!=='v'+version && !new RegExp('^v'+version.replace(/\./g,'\\.')+'-web\\.[1-9][0-9]*$').test(ref))throw new Error('Release tag must match package version: v'+version);}
 export async function backendFingerprint(){
   const files=[...(await readdir('server')).filter(f=>f.endsWith('.js')).map(f=>'server/'+f),'apps-script/Main.gs','apps-script/Bridge.html','apps-script/appsscript.json'];
   const pkg=JSON.parse(await readFile('package.json','utf8'));const hash=createHash('sha256').update(pkg.version+'\n');
