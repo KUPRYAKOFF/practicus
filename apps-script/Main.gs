@@ -1,6 +1,15 @@
-// Public entry points only. All owner/trigger helpers end in an underscore.
+// Data entry points use Core authorization. The editor launcher checks Google identity.
 function api(request) { return Core.api(request); }
 function uploadForm(form) { return Core.uploadForm(form); }
+// Names ending in '_' are hidden in the editor's Run dropdown as well as RPC.
+function runInitialSetup() {
+  var activeEmail = Session.getActiveUser().getEmail();
+  var effectiveEmail = Session.getEffectiveUser().getEmail();
+  if (!activeEmail || !effectiveEmail || activeEmail !== effectiveEmail) {
+    throw new Error('Запустите первоначальную настройку из редактора Apps Script под выделенным аккаунтом приложения.');
+  }
+  return setup_();
+}
 function setup_() { return Core.setup(); }
 function housekeeping_() { return Core.housekeeping(); }
 function doGet(e) {
