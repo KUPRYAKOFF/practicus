@@ -3,6 +3,11 @@ import { Auth } from './auth.js';
 import { PrivateDrive, ensureStorageRoot } from './drive.js';
 import { createService } from './service.js';
 import { assert, LIMIT } from './domain.js';
+import {createBackups} from './backups.js';
+import {BackupStore,ensureBackupRoot} from './backup-store.js';
+export function publicStatus() {
+  return {application:'practicus',version:typeof __APP_VERSION__==='string'?__APP_VERSION__:'development',backend_build:typeof __BACKEND_BUILD__==='string'?__BACKEND_BUILD__:'development'};
+}
 function context() {
   const props=PropertiesService.getScriptProperties();
   const id=props.getProperty('DB_ID'); assert(id,'Сначала выполните setup_','CONFIG');
@@ -12,7 +17,15 @@ function context() {
   const storage=new PrivateDrive(props);
   const limit=Number(props.getProperty('FILE_LIMIT_BYTES') || LIMIT);
   assert(Number.isSafeInteger(limit) && limit>0 && limit<=LIMIT,'Лимит должен быть не более 25 МиБ','CONFIG');
-  return {props,repo,auth,storage,now,uuid,settings:{transportVerified:props.getProperty('FILE_TRANSPORT_VERIFIED')==='true',fileLimit:limit}};
+  const uploadFlag=props.getProperty('FILE_UPLOADS_ENABLED');
+  const ctx={props,repo,auth,storage,now,uuid,settings:{
+    uploadsEnabled:uploadFlag===null?props.getProperty('FILE_TRANSPORT_VERIFIED')==='true':uploadFlag==='true',
+    fileLimit:limit,isMaintenance:()=>props.getProperty('MAINTENANCE_MODE')==='true',release:publicStatus()}};
+  ctx.backups=createBackups({...ctx,store:new BackupStore(props,storage),release:publicStatus(),createRestoreRepo:()=>{
+    const book=SpreadsheetApp.create('Practicus_Restore_INCOMPLETE_'+now().replace(/[:.]/g,'-'));initializeSheets(book.getId());
+    return {id:book.getId(),repo:new SheetRepository(book.getId()),complete:()=>book.rename('Practicus_Restore_'+now().replace(/[:.]/g,'-'))};
+  }});
+  return ctx;
 }
 export function api(request) {
   try { return createService(context()).api(request); }
@@ -35,6 +48,7 @@ export function setup() {
   if(!id) {id=SpreadsheetApp.create('Practicus_DB').getId(); props.setProperty('DB_ID',id);}
   initializeSheets(id);
   ensureStorageRoot(props);
+  ensureBackupRoot(props);
   const ctx=context();
   ctx.storage.check();
   if(!ctx.repo.all('Users').some(u=>u.role==='admin')) {
@@ -48,6 +62,15 @@ export function setup() {
   }
   const existing=ScriptApp.getProjectTriggers().some(t=>t.getHandlerFunction()==='housekeeping_');
   if(!existing) ScriptApp.newTrigger('housekeeping_').timeBased().everyHours(1).create();
+  if(!ScriptApp.getProjectTriggers().some(t=>t.getHandlerFunction()==='metadataBackup_')) {
+    ScriptApp.newTrigger('metadataBackup_').timeBased().atHour(3).nearMinute(30).everyDays(1).inTimezone('Asia/Irkutsk').create();
+  }
+  if(!props.getProperty('BACKUP_LAST_SUCCESS_AT'))ctx.backups.create();
   return {configured:true};
 }
 export function housekeeping() {return createService(context()).housekeeping();}
+export function backupMetadata() {return context().backups.create();}
+export function prepareRestore() {
+  const ctx=context(),id=ctx.props.getProperty('RESTORE_BACKUP_ID');assert(id,'Задайте RESTORE_BACKUP_ID','CONFIG');
+  return ctx.backups.prepareRestore(id);
+}

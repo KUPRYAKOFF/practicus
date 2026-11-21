@@ -54,7 +54,7 @@ export class DemoApi {
     await new Promise(resolve=>setTimeout(resolve,80));
     const u=this.actor();let a=this.assignments.find(a=>a.id===p.assignment_id);
     switch(action) {
-      case 'bootstrap':return {user:{...u},groups:this.groups.filter(g=>g.active),access:this.access.filter(a=>u.role==='admin'||a.teacher_id===u.id),quota:{used:this.used(u),limit:u.quota_bytes},transport_verified:true,file_limit:25*MiB};
+      case 'bootstrap':return {user:{...u},groups:this.groups.filter(g=>g.active),access:this.access.filter(a=>u.role==='admin'||a.teacher_id===u.id),quota:{used:this.used(u),limit:u.quota_bytes},uploads_enabled:true,transport_verified:true,file_limit:25*MiB,release:{version:'1.0.0'}};
       case 'listAssignments':return this.assignments.filter(a=>u.role==='admin'||u.role==='teacher'&&a.teacher_id===u.id||u.role==='student'&&a.publication_status!=='draft'&&(a.publication_status==='archived'?!!this.sub(a.id,u.id):(this.targeted(a,u)||!!this.sub(a.id,u.id)))).map(a=>{
         if(u.role!=='student') {const rows=this.rows(u,a);return {...a,stats:{total:rows.length,submitted:rows.filter(r=>r.submission).length,pending:rows.filter(r=>r.submission?.status==='pending_review').length,accepted:rows.filter(r=>r.submission?.status==='accepted').length,late:rows.filter(r=>r.submission?.is_late).length}};}
         const s=this.sub(a.id,u.id),archived=a.publication_status==='archived',assigned=this.targeted(a,u)&&!archived;
@@ -105,6 +105,8 @@ export class DemoApi {
       case 'saveGroup':{const old=this.groups.find(g=>g.id===p.id);if(old)Object.assign(old,p);else this.groups.push({...p,id:uid()});this.log(u,'group_saved',p.id);return p;}
       case 'saveTeacherAccess':this.access=this.access.filter(a=>a.teacher_id!==p.teacher_id).concat(p.targets.map(t=>({...t,id:uid(),teacher_id:p.teacher_id,active:true})));this.log(u,'teacher_access_changed',p.teacher_id);return {ok:true};
       case 'changePassword':u.must_change_password=false;return {token:this.token,user:{...u}};
+      case 'backupStatus':return this.backup||{last_success_at:null,last_size:0,retained:0,keep:7};
+      case 'createBackup':this.backup={last_success_at:iso(0),last_size:2048,retained:1,keep:7};return this.backup;
       case 'storageHealth':return {owner:'Демонстрационный аккаунт',storageQuota:{usage:this.used(u),limit:15*1024*MiB}};
       case 'runCleanup':return {deleted:0,pending:0};
       case 'logout':this.token=null;return {ok:true};

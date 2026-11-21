@@ -1,61 +1,105 @@
-name: Check and publish GitHub Pages
+name: Verify and release Practicus
 on:
   push:
     branches: [main]
   pull_request:
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      release_ref:
+        description: 'Release tag to build, for example v1.0.0'
+        required: true
+        type: string
+        default: v1.0.0
+      deploy:
+        description: 'Publish Pages after verifying the matching Apps Script version'
+        required: true
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
-  group: pages-${{ github.ref }}
+  group: verify-${{ github.event_name }}-${{ inputs.release_ref || github.ref }}
   cancel-in-progress: true
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref || github.event.release.tag_name || github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
+      - name: Record source revision
+        run: echo "RELEASE_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - run: npm ci --no-audit --no-fund
       - run: npm test
       - run: npm run check
       - run: npm run build
       - run: git diff --exit-code -- apps-script/Core.gs
+      - run: npm run package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: dist/
       - uses: actions/upload-artifact@v4
         with:
           name: apps-script
           path: dist/apps-script/
       - uses: actions/upload-pages-artifact@v3
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'workflow_dispatch' && inputs.deploy
         with:
           path: dist/site
-  deploy:
-    if: github.event_name != 'pull_request'
+  release-assets:
+    if: github.event_name == 'release'
     needs: build
     runs-on: ubuntu-latest
     permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: dist
+      - name: Attach versioned release packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/*.zip dist/SHA256SUMS.txt dist/release-manifest.json --clobber
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy
+    needs: build
+    runs-on: ubuntu-latest
+    concurrency:
+      group: practicus-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
       pages: write
       id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Check Pages configuration
-        id: pages
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: dist
+      - name: Require matching Apps Script release
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh api "repos/$GITHUB_REPOSITORY/pages" --silent; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Pages is not configured or accessible. Enable GitHub Actions in Settings > Pages, then rerun this workflow. Build artifacts are ready."
-          fi
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: node scripts/check-deployment.mjs
       - uses: actions/configure-pages@v5
-        if: steps.pages.outputs.enabled == 'true'
       - name: Deploy
         id: deployment
-        if: steps.pages.outputs.enabled == 'true'
         uses: actions/deploy-pages@v4

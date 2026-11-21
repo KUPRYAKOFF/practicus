@@ -2,7 +2,8 @@ import { assert, fail, text, checkSubmit, studentAccess, sameGroup, canTeach, te
   validateManifest, validateBytes, quotaCheck, expired, LIMIT, MiB } from './domain.js';
 import { publicUser, passwordRecord, safeEqual, digest } from './auth.js';
 
-export function createService({repo,auth,storage,now,uuid,settings}) {
+export function createService({repo,auth,storage,now,uuid,settings,backups}) {
+  const requireAvailable=()=>assert(!settings.isMaintenance?.(),'Ведутся технические работы. Повторите позже','MAINTENANCE');
   const audit=(actor,action,id,details={})=>repo.put('Audit',{id:uuid(),actor_id:actor?.id || 'system',action,entity_id:id,at:now(),details});
   const submission=(assignmentId,studentId)=>repo.all('Submissions').find(s=>s.assignment_id===assignmentId && s.student_id===studentId);
   const getAssignment=id=>{const a=repo.get('Assignments',id); assert(a,'Задание не найдено','NOT_FOUND'); return a;};
@@ -66,7 +67,7 @@ export function createService({repo,auth,storage,now,uuid,settings}) {
     });
   }
   function reserve(u,p) {
-    assert(settings.transportVerified || (u.role==='admin' && p.kind==='spike'), 'Загрузка откроется после проверки файлового транспорта администратором', 'TRANSPORT_UNVERIFIED');
+    assert(settings.uploadsEnabled || (u.role==='admin' && p.kind==='spike'), 'Загрузка файлов отключена администратором', 'UPLOADS_DISABLED');
     assert(['submission','materials','spike'].includes(p.kind), 'Неверная операция','VALIDATION');
     const manifest=validateManifest(p.files,settings.fileLimit || LIMIT);
     const key=text(p.idempotency_key,100); assert(key.length>=16,'Нужен ключ операции','VALIDATION');
@@ -106,7 +107,7 @@ export function createService({repo,auth,storage,now,uuid,settings}) {
   function upload(token,reservationId,blobs) {
     let r,u;
     const early=repo.lock(()=>{
-      u=auth.actor(token); r=repo.get('UploadReservations',reservationId);
+      requireAvailable();u=auth.actor(token); r=repo.get('UploadReservations',reservationId);
       assert(r && r.user_id===u.id,'Операция недоступна');
       const recovered=recoverCommitted(r);
       if(r.status==='committed' || recovered) {
@@ -115,7 +116,7 @@ export function createService({repo,auth,storage,now,uuid,settings}) {
       }
       assert(r.status==='reserved','Загрузка уже выполняется или завершилась ошибкой','CONFLICT');
       assert(r.expires_at>=now(),'Время загрузки истекло. Начните заново','TIMEOUT');
-      assert(settings.transportVerified || (u.role==='admin' && r.kind==='spike'),'Транспорт не проверен','TRANSPORT_UNVERIFIED');
+      assert(settings.uploadsEnabled || (u.role==='admin' && r.kind==='spike'),'Загрузка файлов отключена','UPLOADS_DISABLED');
       r=repo.put('UploadReservations',{...r,status:'receiving',file_ids:r.manifest.map(()=>uuid())});
       return null;
     });
@@ -134,7 +135,7 @@ export function createService({repo,auth,storage,now,uuid,settings}) {
         repo.lock(()=>repo.put(fileTable,{id:r.file_ids[i],...saved}));
       }
       return repo.lock(()=>{
-        u=auth.actor(token); r=repo.get('UploadReservations',r.id);
+        requireAvailable();u=auth.actor(token); r=repo.get('UploadReservations',r.id);
         assert(r.status==='receiving','Загрузка отменена','CONFLICT');
         assert(now()<=r.expires_at,'Загрузка превысила две минуты','TIMEOUT');
         const replacement=currentFiles().filter(f=>f.owner_id===u.id && f.assignment_id===r.assignment_id &&
@@ -292,12 +293,13 @@ export function createService({repo,auth,storage,now,uuid,settings}) {
   function api(request) {
     try {
       assert(request && typeof request==='object','Некорректный запрос','VALIDATION');
+      requireAvailable();
       const {action,token,payload={}}=request;
       if(action==='login') return {ok:true,data:auth.signIn(payload.login,payload.password)};
       const u=auth.actor(token,['changePassword','logout','bootstrap'].includes(action));
       if(action==='bootstrap') return {ok:true,data:{user:publicUser(u),groups:repo.all('Groups').filter(g=>g.active),
         access:u.role==='student'?[]:repo.all('TeacherAccess').filter(a=>a.active && (u.role==='admin' || a.teacher_id===u.id)),
-        quota:{used:used(u),limit:u.quota_bytes},transport_verified:settings.transportVerified,file_limit:settings.fileLimit || LIMIT}};
+        quota:{used:used(u),limit:u.quota_bytes},uploads_enabled:settings.uploadsEnabled,transport_verified:settings.uploadsEnabled,file_limit:settings.fileLimit || LIMIT,release:settings.release}};
       if(action==='listAssignments') return {ok:true,data:visibleAssignments(u)};
       if(action==='reviewRows') return {ok:true,data:reviewRows(u,getAssignment(payload.assignment_id))};
       if(action==='uploadStatus') {
@@ -322,17 +324,21 @@ export function createService({repo,auth,storage,now,uuid,settings}) {
             pending:files.filter(f=>f.delete_pending).length},
           operations:repo.all('UploadReservations').slice(-30).map(({id,status,kind,started_at,total,error})=>({id,status,kind,started_at,total,error}))}};
       }
+      if(action==='backupStatus') {requireAdmin(u);assert(backups,'Обновите Apps Script для резервирования','CONFIG');return {ok:true,data:backups.status()};}
+      if(action==='createBackup') {requireAdmin(u);assert(backups,'Обновите Apps Script для резервирования','CONFIG');return {ok:true,data:backups.create()};}
       if(action==='storageHealth') {requireAdmin(u); return {ok:true,data:storage.check()};}
       if(action==='runCleanup') {requireAdmin(u);return {ok:true,data:housekeeping()};}
       // Recheck session after taking the lock: blocking/revocation must beat queued calls.
-      return {ok:true,data:repo.lock(()=>mutate(auth.actor(token,['changePassword','logout'].includes(action)),action,{...payload,...(action==='logout'?{token}:{})}))};
+      return {ok:true,data:repo.lock(()=>{requireAvailable();return mutate(auth.actor(token,['changePassword','logout'].includes(action)),action,{...payload,...(action==='logout'?{token}:{})});})};
     } catch(error) {
       return {ok:false,error:{code:error.code || 'INTERNAL',message:error.code?error.message:'Ошибка сервера. Повторите действие или обратитесь к администратору'}};
     }
   }
   function housekeeping() {
+    requireAvailable();
     const results={deleted:0,pending:0};
     repo.lock(()=>{
+      requireAvailable();
       for(const r of repo.all('UploadReservations').filter(r=>['reserved','receiving'].includes(r.status) && Date.parse(r.expires_at)+600000<Date.parse(now()))) {
         const recovered=recoverCommitted(r);
         repo.put('UploadReservations',{...r,status:recovered?'committed':'expired',result:recovered || null});

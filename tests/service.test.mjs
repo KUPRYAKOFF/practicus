@@ -90,8 +90,8 @@ test('stale generation review rejected; grade optional; revoked teacher blocked'
   assert.equal(f.call('review',p,'t').data.grade,null);
   f.repo.put('TeacherAccess',{id:'ta',active:false});assert.equal(f.call('review',p,'t').ok,false);
 });
-test('production uploads stay gated until spike; admin spike still works',()=>{
-  const f=fixture({verified:false});assert.equal(f.reserve().error.code,'TRANSPORT_UNVERIFIED');
+test('administrator can disable uploads; admin diagnostic upload still works',()=>{
+  const f=fixture({verified:false});assert.equal(f.reserve().error.code,'UPLOADS_DISABLED');
   const r=f.reserve({kind:'spike',assignment_id:null},'admin');assert.equal(r.ok,true);assert.equal(f.finish(r,[f.blob('hello')],'admin').files.length,1);
 });
 test('commit journal recovery after lost final response preserves new files',()=>{
@@ -105,4 +105,13 @@ test('hidden draft and archived grades cannot be used to delete cached submissio
     const f=fixture();f.finish(f.reserve());const s=f.repo.all('Submissions')[0];f.repo.put('Assignments',{id:'a',publication_status:status});
     assert.equal(f.call('deleteSubmissionFiles',{submission_id:s.id,confirm:true}).error.code,'FORBIDDEN');
   }
+});
+test('maintenance rejects queued requests and upload commits without losing prior work',()=>{
+  const f=fixture({onCreate:()=>{f.settings.isMaintenance=()=>true;}});const r=f.reserve();assert.throws(()=>f.finish(r),e=>e.code==='MAINTENANCE');
+  assert.equal(f.call('listAssignments').error.code,'MAINTENANCE');assert.equal(f.repo.all('Submissions').length,0);
+});
+test('backup status and creation are available only to application admins',()=>{
+  let calls=0;const f=fixture({backups:{status:()=>({retained:7}),create:()=>{calls++;return {retained:7};}}});
+  for(const role of ['s','t'])for(const action of ['backupStatus','createBackup'])assert.equal(f.call(action,{},role).error.code,'FORBIDDEN');
+  assert.equal(calls,0);assert.equal(f.call('backupStatus',{},'admin').data.retained,7);assert.equal(f.call('createBackup',{},'admin').ok,true);assert.equal(calls,1);
 });

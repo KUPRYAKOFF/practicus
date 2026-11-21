@@ -1,4 +1,8 @@
 import { assert } from './domain.js';
+export function ensureSheetRows(sheet,required) {
+  const available=sheet.getMaxRows();
+  if(required>available)sheet.insertRowsAfter(available,Math.max(500,required-available));
+}
 export const SCHEMA = {
   Users: ['id','full_name','login','role','group_id','subgroup','status','quota_bytes','password_hash','salt','iterations','must_change_password','created_at'],
   UserIntake: ['id','full_name','login','role','group_id','subgroup','status','error'],
@@ -39,11 +43,17 @@ export class SheetRepository {
     const rows = this.all(table); const index = rows.findIndex(row => row.id === record.id);
     const next = { ...(index >= 0 ? rows[index] : {}), ...record };
     const cells = SCHEMA[table].map(key => JSON.stringify(next[key] ?? null));
-    this.sheet(table).getRange(index >= 0 ? index + 2 : rows.length + 2,1,1,cells.length).setValues([cells]);
+    const sheet=this.sheet(table),row=index>=0?index+2:rows.length+2;ensureSheetRows(sheet,row);
+    sheet.getRange(row,1,1,cells.length).setValues([cells]);
     if (index >= 0) rows[index] = next; else rows.push(next);
     return next;
   }
   refresh() { this.cache = {}; }
+  writeEmptyTable(table,records) {
+    assert(this.all(table).length===0,'Восстановление допускается только в пустой лист','BACKUP');
+    if(records.length){const sheet=this.sheet(table);ensureSheetRows(sheet,records.length+1);sheet.getRange(2,1,records.length,SCHEMA[table].length).setValues(records.map(record=>SCHEMA[table].map(key=>JSON.stringify(record[key]??null))));}
+    delete this.cache[table];
+  }
   normalizeIntake() {
     const sheet=this.sheet('UserIntake'),count=sheet.getLastRow()-1;if(count<=0)return;
     const rows=sheet.getRange(2,1,count,SCHEMA.UserIntake.length).getValues();

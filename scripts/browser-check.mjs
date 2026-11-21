@@ -8,12 +8,14 @@ const failures=[];page.on('pageerror',e=>failures.push(e.message));
 page.on('console',m=>{if(m.type()==='error')failures.push(m.text());});
 const base=process.env.TEST_URL || 'http://127.0.0.1:4173';
 const results=[];
+const skipFileTests=process.env.SKIP_FILE_TESTS==='1';
+const reviewTitle=skipFileTests?'Исследование закона Ома':'Расчёт электрических цепей';
 async function check(name,fn){await fn();results.push(name);console.log('PASS',name);}
 await mkdir('work/screenshots',{recursive:true});
 try{
-  await check('Login screen, no configured production login',async()=>{
+  await check('Login screen respects the configured production endpoint',async()=>{
     await page.goto(base);await page.getByRole('heading',{name:'С возвращением'}).waitFor();
-    assert(await page.getByRole('button',{name:'Войти в приложение'}).isDisabled());
+    assert.equal(await page.getByRole('button',{name:'Войти в приложение'}).isDisabled(),!await page.evaluate(()=>Boolean(window.PRACTICUS_CONFIG.apiUrl)));
     await page.screenshot({path:'work/screenshots/login.png',fullPage:true});
   });
   await check('Student filters, search, archive grade only',async()=>{
@@ -28,7 +30,7 @@ try{
     await page.getByRole('button',{name:'Все практические'}).click();
     await page.screenshot({path:'work/screenshots/student.png',fullPage:true});
   });
-  await check('Student uploads, replacement confirmation and old-file removal',async()=>{
+  if(!skipFileTests)await check('Student uploads, replacement confirmation and old-file removal',async()=>{
     await page.getByRole('button',{name:'Расчёт электрических цепей',exact:true}).click();
     await page.locator('#upload-files').setInputFiles({name:'Отчёт.txt',mimeType:'text/plain',buffer:Buffer.from('Первый отчёт')});
     await page.getByRole('button',{name:'Отправить работу',exact:true}).click();
@@ -47,7 +49,7 @@ try{
   });
   await check('Teacher review optional grade and late revision',async()=>{
     await page.locator('#demo-role').selectOption('teacher');await page.getByRole('heading',{name:'Практические работы',exact:true}).waitFor();
-    const row=page.locator('tbody tr').filter({has:page.getByRole('button',{name:'Расчёт электрических цепей',exact:true})});
+    const row=page.locator('tbody tr').filter({has:page.getByRole('button',{name:reviewTitle,exact:true})});
     await row.getByRole('button',{name:'Проверить',exact:true}).click();
     await page.getByRole('heading',{name:'Проверка работ',exact:true}).waitFor();
     const student=page.locator('tbody tr').filter({hasText:'Алексей Соколов'});
@@ -56,7 +58,7 @@ try{
     await page.getByRole('button',{name:'Сохранить решение'}).click();await page.locator('#modal').waitFor({state:'hidden'});
     await student.getByText('На доработке',{exact:true}).waitFor();
     await page.screenshot({path:'work/screenshots/teacher.png',fullPage:true});
-    await page.locator('#demo-role').selectOption('student');await page.getByRole('button',{name:'Расчёт электрических цепей',exact:true}).click();
+    await page.locator('#demo-role').selectOption('student');await page.getByRole('button',{name:reviewTitle,exact:true}).click();
     await page.getByText('Добавьте вывод.',{exact:true}).waitFor();
   });
   await check('Teacher creates assignment and publishes it',async()=>{
@@ -82,7 +84,7 @@ try{
     await page.getByRole('button',{name:'Пароль сохранён'}).click();
     await page.getByRole('button',{name:'Доступ преподавателей',exact:true}).click();await page.getByRole('button',{name:'Настроить',exact:true}).click();
     await page.locator('input[name="target"][value="g2"]').uncheck();await page.getByRole('button',{name:'Сохранить',exact:true}).click();await page.locator('#modal').waitFor({state:'hidden'});
-    await page.getByRole('button',{name:'Обзор',exact:true}).click();await page.screenshot({path:'work/screenshots/admin.png',fullPage:true});
+    await page.getByRole('button',{name:'Настройки',exact:true}).click();await page.getByRole('heading',{name:'Резервные копии',exact:true}).waitFor();await page.getByRole('button',{name:'Создать копию',exact:true}).click();await page.getByText(/Последняя копия:/).waitFor();await page.getByRole('button',{name:'Обзор',exact:true}).click();await page.screenshot({path:'work/screenshots/admin.png',fullPage:true});
   });
   await check('Dark theme persists without credentials in localStorage',async()=>{
     await page.getByRole('button',{name:'Сменить тему'}).click();

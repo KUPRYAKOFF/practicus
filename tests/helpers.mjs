@@ -8,6 +8,7 @@ export class MemoryRepo {
   get(table,id){return this.all(table).find(r=>r.id===id);}
   put(table,record){if(this.failPut?.(table,record))throw new Error('injected persistence failure');const rows=this.all(table),i=rows.findIndex(r=>r.id===record.id),next={...(i>=0?rows[i]:{}),...structuredClone(record)};if(i<0)rows.push(next);else rows[i]=next;return next;}
   refresh(){}
+  writeEmptyTable(table,records){if(this.all(table).length)throw new Error('not empty');this.tables[table]=structuredClone(records);}
   lock(fn){return fn();}
 }
 export function fixture(options={}){
@@ -23,8 +24,8 @@ export function fixture(options={}){
     remove(id){if(options.failDelete)throw new Error('delete failed');blobs.delete(id);},
     chunk(id,offset,size){if(!blobs.has(id))throw new Error('missing');return Buffer.from(blobs.get(id).getBytes().slice(offset,offset+size)).toString('base64');},check(){return {};}
   };
-  const settings={transportVerified:options.verified!==false};
-  const app=createService({repo,auth,storage,now,uuid:randomUUID,settings});
+  const settings={uploadsEnabled:options.verified!==false};
+  const app=createService({repo,auth,storage,now,uuid:randomUUID,settings,backups:options.backups});
   const call=(action,payload={},token='s')=>app.api({action,token,payload});
   const reserve=(extra={},token='s')=>call('beginUpload',{kind:'submission',assignment_id:'a',files:[{name:'report.txt',size:5,type:'text/plain'}],idempotency_key:randomUUID(),...extra},token);
   const blob=text=>({getBytes:()=>[...Buffer.from(text)]});

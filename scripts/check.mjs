@@ -8,5 +8,5 @@ for(const f of ['package.json','apps-script/appsscript.json'])JSON.parse(await r
 const html=await readFile('web/index.html','utf8');
 if(!html.includes('lang="ru"') || !html.includes('Content-Security-Policy'))throw new Error('HTML security/language metadata missing');
 const main=await readFile('apps-script/Main.gs','utf8');
-for(const name of [...main.matchAll(/function\s+(\w+)\(/g)].map(m=>m[1]))if(!['api','uploadForm','doGet','runInitialSetup'].includes(name)&&!name.endsWith('_'))throw new Error('Unexpected public Apps Script entry '+name);
+for(const name of [...main.matchAll(/function\s+(\w+)\(/g)].map(m=>m[1]))if(!['api','uploadForm','doGet','runInitialSetup','runMetadataBackup','runPrepareRestore'].includes(name)&&!name.endsWith('_'))throw new Error('Unexpected public Apps Script entry '+name);
 console.log('Syntax, JSON, HTML metadata and Apps Script entry points checked');

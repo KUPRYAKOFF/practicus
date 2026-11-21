@@ -50,7 +50,10 @@ var Core = (() => {
   var main_exports = {};
   __export(main_exports, {
     api: () => api,
+    backupMetadata: () => backupMetadata,
     housekeeping: () => housekeeping,
+    prepareRestore: () => prepareRestore,
+    publicStatus: () => publicStatus,
     setup: () => setup,
     uploadForm: () => uploadForm
   });
@@ -153,6 +156,10 @@ var Core = (() => {
   }
 
   // server/repository.js
+  function ensureSheetRows(sheet, required) {
+    const available = sheet.getMaxRows();
+    if (required > available) sheet.insertRowsAfter(available, Math.max(500, required - available));
+  }
   var SCHEMA = {
     Users: ["id", "full_name", "login", "role", "group_id", "subgroup", "status", "quota_bytes", "password_hash", "salt", "iterations", "must_change_password", "created_at"],
     UserIntake: ["id", "full_name", "login", "role", "group_id", "subgroup", "status", "error"],
@@ -200,16 +207,27 @@ var Core = (() => {
     }
     put(table, record) {
       const rows = this.all(table);
-      const index = rows.findIndex((row) => row.id === record.id);
+      const index = rows.findIndex((row2) => row2.id === record.id);
       const next = { ...index >= 0 ? rows[index] : {}, ...record };
       const cells = SCHEMA[table].map((key) => JSON.stringify(next[key] ?? null));
-      this.sheet(table).getRange(index >= 0 ? index + 2 : rows.length + 2, 1, 1, cells.length).setValues([cells]);
+      const sheet = this.sheet(table), row = index >= 0 ? index + 2 : rows.length + 2;
+      ensureSheetRows(sheet, row);
+      sheet.getRange(row, 1, 1, cells.length).setValues([cells]);
       if (index >= 0) rows[index] = next;
       else rows.push(next);
       return next;
     }
     refresh() {
       this.cache = {};
+    }
+    writeEmptyTable(table, records) {
+      assert(this.all(table).length === 0, "\u0412\u043E\u0441\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 \u0434\u043E\u043F\u0443\u0441\u043A\u0430\u0435\u0442\u0441\u044F \u0442\u043E\u043B\u044C\u043A\u043E \u0432 \u043F\u0443\u0441\u0442\u043E\u0439 \u043B\u0438\u0441\u0442", "BACKUP");
+      if (records.length) {
+        const sheet = this.sheet(table);
+        ensureSheetRows(sheet, records.length + 1);
+        sheet.getRange(2, 1, records.length, SCHEMA[table].length).setValues(records.map((record) => SCHEMA[table].map((key) => JSON.stringify(record[key] ?? null))));
+      }
+      delete this.cache[table];
     }
     normalizeIntake() {
       const sheet = this.sheet("UserIntake"), count = sheet.getLastRow() - 1;
@@ -930,7 +948,8 @@ var Core = (() => {
   };
 
   // server/service.js
-  function createService({ repo, auth, storage, now, uuid, settings }) {
+  function createService({ repo, auth, storage, now, uuid, settings, backups }) {
+    const requireAvailable = () => assert(!settings.isMaintenance?.(), "\u0412\u0435\u0434\u0443\u0442\u0441\u044F \u0442\u0435\u0445\u043D\u0438\u0447\u0435\u0441\u043A\u0438\u0435 \u0440\u0430\u0431\u043E\u0442\u044B. \u041F\u043E\u0432\u0442\u043E\u0440\u0438\u0442\u0435 \u043F\u043E\u0437\u0436\u0435", "MAINTENANCE");
     const audit = (actor, action, id, details = {}) => repo.put("Audit", { id: uuid(), actor_id: actor?.id || "system", action, entity_id: id, at: now(), details });
     const submission = (assignmentId, studentId) => repo.all("Submissions").find((s) => s.assignment_id === assignmentId && s.student_id === studentId);
     const getAssignment = (id) => {
@@ -1023,7 +1042,7 @@ var Core = (() => {
       });
     }
     function reserve(u, p) {
-      assert(settings.transportVerified || u.role === "admin" && p.kind === "spike", "\u0417\u0430\u0433\u0440\u0443\u0437\u043A\u0430 \u043E\u0442\u043A\u0440\u043E\u0435\u0442\u0441\u044F \u043F\u043E\u0441\u043B\u0435 \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0438 \u0444\u0430\u0439\u043B\u043E\u0432\u043E\u0433\u043E \u0442\u0440\u0430\u043D\u0441\u043F\u043E\u0440\u0442\u0430 \u0430\u0434\u043C\u0438\u043D\u0438\u0441\u0442\u0440\u0430\u0442\u043E\u0440\u043E\u043C", "TRANSPORT_UNVERIFIED");
+      assert(settings.uploadsEnabled || u.role === "admin" && p.kind === "spike", "\u0417\u0430\u0433\u0440\u0443\u0437\u043A\u0430 \u0444\u0430\u0439\u043B\u043E\u0432 \u043E\u0442\u043A\u043B\u044E\u0447\u0435\u043D\u0430 \u0430\u0434\u043C\u0438\u043D\u0438\u0441\u0442\u0440\u0430\u0442\u043E\u0440\u043E\u043C", "UPLOADS_DISABLED");
       assert(["submission", "materials", "spike"].includes(p.kind), "\u041D\u0435\u0432\u0435\u0440\u043D\u0430\u044F \u043E\u043F\u0435\u0440\u0430\u0446\u0438\u044F", "VALIDATION");
       const manifest = validateManifest(p.files, settings.fileLimit || LIMIT);
       const key = text(p.idempotency_key, 100);
@@ -1084,6 +1103,7 @@ var Core = (() => {
     function upload(token, reservationId, blobs) {
       let r, u;
       const early = repo.lock(() => {
+        requireAvailable();
         u = auth.actor(token);
         r = repo.get("UploadReservations", reservationId);
         assert(r && r.user_id === u.id, "\u041E\u043F\u0435\u0440\u0430\u0446\u0438\u044F \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0430");
@@ -1094,7 +1114,7 @@ var Core = (() => {
         }
         assert(r.status === "reserved", "\u0417\u0430\u0433\u0440\u0443\u0437\u043A\u0430 \u0443\u0436\u0435 \u0432\u044B\u043F\u043E\u043B\u043D\u044F\u0435\u0442\u0441\u044F \u0438\u043B\u0438 \u0437\u0430\u0432\u0435\u0440\u0448\u0438\u043B\u0430\u0441\u044C \u043E\u0448\u0438\u0431\u043A\u043E\u0439", "CONFLICT");
         assert(r.expires_at >= now(), "\u0412\u0440\u0435\u043C\u044F \u0437\u0430\u0433\u0440\u0443\u0437\u043A\u0438 \u0438\u0441\u0442\u0435\u043A\u043B\u043E. \u041D\u0430\u0447\u043D\u0438\u0442\u0435 \u0437\u0430\u043D\u043E\u0432\u043E", "TIMEOUT");
-        assert(settings.transportVerified || u.role === "admin" && r.kind === "spike", "\u0422\u0440\u0430\u043D\u0441\u043F\u043E\u0440\u0442 \u043D\u0435 \u043F\u0440\u043E\u0432\u0435\u0440\u0435\u043D", "TRANSPORT_UNVERIFIED");
+        assert(settings.uploadsEnabled || u.role === "admin" && r.kind === "spike", "\u0417\u0430\u0433\u0440\u0443\u0437\u043A\u0430 \u0444\u0430\u0439\u043B\u043E\u0432 \u043E\u0442\u043A\u043B\u044E\u0447\u0435\u043D\u0430", "UPLOADS_DISABLED");
         r = repo.put("UploadReservations", { ...r, status: "receiving", file_ids: r.manifest.map(() => uuid()) });
         return null;
       });
@@ -1123,6 +1143,7 @@ var Core = (() => {
           repo.lock(() => repo.put(fileTable, { id: r.file_ids[i], ...saved }));
         }
         return repo.lock(() => {
+          requireAvailable();
           u = auth.actor(token);
           r = repo.get("UploadReservations", r.id);
           assert(r.status === "receiving", "\u0417\u0430\u0433\u0440\u0443\u0437\u043A\u0430 \u043E\u0442\u043C\u0435\u043D\u0435\u043D\u0430", "CONFLICT");
@@ -1356,6 +1377,7 @@ var Core = (() => {
     function api2(request) {
       try {
         assert(request && typeof request === "object", "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0437\u0430\u043F\u0440\u043E\u0441", "VALIDATION");
+        requireAvailable();
         const { action, token, payload = {} } = request;
         if (action === "login") return { ok: true, data: auth.signIn(payload.login, payload.password) };
         const u = auth.actor(token, ["changePassword", "logout", "bootstrap"].includes(action));
@@ -1364,8 +1386,10 @@ var Core = (() => {
           groups: repo.all("Groups").filter((g) => g.active),
           access: u.role === "student" ? [] : repo.all("TeacherAccess").filter((a) => a.active && (u.role === "admin" || a.teacher_id === u.id)),
           quota: { used: used(u), limit: u.quota_bytes },
-          transport_verified: settings.transportVerified,
-          file_limit: settings.fileLimit || LIMIT
+          uploads_enabled: settings.uploadsEnabled,
+          transport_verified: settings.uploadsEnabled,
+          file_limit: settings.fileLimit || LIMIT,
+          release: settings.release
         } };
         if (action === "listAssignments") return { ok: true, data: visibleAssignments(u) };
         if (action === "reviewRows") return { ok: true, data: reviewRows(u, getAssignment(payload.assignment_id)) };
@@ -1401,6 +1425,16 @@ var Core = (() => {
             operations: repo.all("UploadReservations").slice(-30).map(({ id, status, kind, started_at, total, error }) => ({ id, status, kind, started_at, total, error }))
           } };
         }
+        if (action === "backupStatus") {
+          requireAdmin(u);
+          assert(backups, "\u041E\u0431\u043D\u043E\u0432\u0438\u0442\u0435 Apps Script \u0434\u043B\u044F \u0440\u0435\u0437\u0435\u0440\u0432\u0438\u0440\u043E\u0432\u0430\u043D\u0438\u044F", "CONFIG");
+          return { ok: true, data: backups.status() };
+        }
+        if (action === "createBackup") {
+          requireAdmin(u);
+          assert(backups, "\u041E\u0431\u043D\u043E\u0432\u0438\u0442\u0435 Apps Script \u0434\u043B\u044F \u0440\u0435\u0437\u0435\u0440\u0432\u0438\u0440\u043E\u0432\u0430\u043D\u0438\u044F", "CONFIG");
+          return { ok: true, data: backups.create() };
+        }
         if (action === "storageHealth") {
           requireAdmin(u);
           return { ok: true, data: storage.check() };
@@ -1409,14 +1443,19 @@ var Core = (() => {
           requireAdmin(u);
           return { ok: true, data: housekeeping2() };
         }
-        return { ok: true, data: repo.lock(() => mutate(auth.actor(token, ["changePassword", "logout"].includes(action)), action, { ...payload, ...action === "logout" ? { token } : {} })) };
+        return { ok: true, data: repo.lock(() => {
+          requireAvailable();
+          return mutate(auth.actor(token, ["changePassword", "logout"].includes(action)), action, { ...payload, ...action === "logout" ? { token } : {} });
+        }) };
       } catch (error) {
         return { ok: false, error: { code: error.code || "INTERNAL", message: error.code ? error.message : "\u041E\u0448\u0438\u0431\u043A\u0430 \u0441\u0435\u0440\u0432\u0435\u0440\u0430. \u041F\u043E\u0432\u0442\u043E\u0440\u0438\u0442\u0435 \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0435 \u0438\u043B\u0438 \u043E\u0431\u0440\u0430\u0442\u0438\u0442\u0435\u0441\u044C \u043A \u0430\u0434\u043C\u0438\u043D\u0438\u0441\u0442\u0440\u0430\u0442\u043E\u0440\u0443" } };
       }
     }
     function housekeeping2() {
+      requireAvailable();
       const results = { deleted: 0, pending: 0 };
       repo.lock(() => {
+        requireAvailable();
         for (const r of repo.all("UploadReservations").filter((r2) => ["reserved", "receiving"].includes(r2.status) && Date.parse(r2.expires_at) + 6e5 < Date.parse(now()))) {
           const recovered = recoverCommitted(r);
           repo.put("UploadReservations", { ...r, status: recovered ? "committed" : "expired", result: recovered || null });
@@ -1445,7 +1484,262 @@ var Core = (() => {
     return { api: api2, upload, housekeeping: housekeeping2 };
   }
 
+  // server/backups.js
+  var BACKUP_TABLES = ["Users", "Groups", "TeacherAccess", "Assignments", "Materials", "Submissions", "SubmissionFiles", "Audit", "Settings"];
+  var MAX_BACKUP_BYTES = 20 * 1024 * 1024;
+  var canonical = (value) => {
+    if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
+    if (value && typeof value === "object") return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + canonical(value[key])).join(",") + "}";
+    return JSON.stringify(value);
+  };
+  function makeSnapshot(repo, { id, at, sourceDb, storageRoot, release }) {
+    const tables = {};
+    for (const table of BACKUP_TABLES) tables[table] = repo.all(table).map((row) => Object.fromEntries(SCHEMA[table].map((key) => [key, row[key] ?? null])));
+    const payload = {
+      format: "practicus-metadata",
+      version: 1,
+      id,
+      created_at: at,
+      source_db: sourceDb,
+      storage_root: storageRoot,
+      release,
+      schema: Object.fromEntries(BACKUP_TABLES.map((table) => [table, SCHEMA[table]])),
+      tables
+    };
+    const normalized = JSON.parse(JSON.stringify(payload));
+    return { payload: normalized, sha256: digest(canonical(normalized)) };
+  }
+  function validateSnapshot(envelope, storageRoot) {
+    const p = envelope?.payload;
+    assert(p?.format === "practicus-metadata" && p.version === 1, "\u041D\u0435\u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u043C\u044B\u0439 \u0444\u043E\u0440\u043C\u0430\u0442 \u0440\u0435\u0437\u0435\u0440\u0432\u043D\u043E\u0439 \u043A\u043E\u043F\u0438\u0438", "BACKUP");
+    assert(typeof envelope.sha256 === "string" && digest(canonical(p)) === envelope.sha256, "\u041A\u043E\u043D\u0442\u0440\u043E\u043B\u044C\u043D\u0430\u044F \u0441\u0443\u043C\u043C\u0430 \u0440\u0435\u0437\u0435\u0440\u0432\u043D\u043E\u0439 \u043A\u043E\u043F\u0438\u0438 \u043D\u0435 \u0441\u043E\u0432\u043F\u0430\u043B\u0430", "BACKUP");
+    assert(p.storage_root === storageRoot, "\u041A\u043E\u043F\u0438\u044F \u043E\u0442\u043D\u043E\u0441\u0438\u0442\u0441\u044F \u043A \u0434\u0440\u0443\u0433\u043E\u043C\u0443 \u0445\u0440\u0430\u043D\u0438\u043B\u0438\u0449\u0443 Drive", "BACKUP");
+    assert(Number.isFinite(Date.parse(p.created_at)) && typeof p.id === "string" && p.id.length > 0, "\u041F\u043E\u0432\u0440\u0435\u0436\u0434\u0435\u043D\u044B \u0441\u0432\u0435\u0434\u0435\u043D\u0438\u044F \u043E \u043A\u043E\u043F\u0438\u0438", "BACKUP");
+    assert(p.tables && p.schema && typeof p.tables === "object" && typeof p.schema === "object", "\u041D\u0435\u0432\u0435\u0440\u043D\u0430\u044F \u0441\u0442\u0440\u0443\u043A\u0442\u0443\u0440\u0430 \u0440\u0435\u0437\u0435\u0440\u0432\u043D\u043E\u0439 \u043A\u043E\u043F\u0438\u0438", "BACKUP");
+    assert(JSON.stringify(Object.keys(p.tables).sort()) === JSON.stringify([...BACKUP_TABLES].sort()), "\u041D\u0435\u0432\u0435\u0440\u043D\u044B\u0439 \u0441\u043E\u0441\u0442\u0430\u0432 \u0440\u0435\u0437\u0435\u0440\u0432\u043D\u043E\u0439 \u043A\u043E\u043F\u0438\u0438", "BACKUP");
+    for (const table of BACKUP_TABLES) {
+      assert(JSON.stringify(p.schema[table]) === JSON.stringify(SCHEMA[table]), "\u041D\u0435\u0441\u043E\u0432\u043C\u0435\u0441\u0442\u0438\u043C\u0430\u044F \u0441\u0445\u0435\u043C\u0430 " + table, "BACKUP");
+      const ids = /* @__PURE__ */ new Set();
+      assert(Array.isArray(p.tables[table]), "\u041F\u043E\u0432\u0440\u0435\u0436\u0434\u0451\u043D \u043B\u0438\u0441\u0442 " + table, "BACKUP");
+      for (const row of p.tables[table]) {
+        assert(row && typeof row.id === "string" && row.id && !ids.has(row.id), "\u041F\u043E\u0432\u0442\u043E\u0440\u044F\u044E\u0449\u0438\u0439\u0441\u044F \u0438\u043B\u0438 \u043F\u0443\u0441\u0442\u043E\u0439 ID \u0432 " + table, "BACKUP");
+        ids.add(row.id);
+        assert(JSON.stringify(Object.keys(row).sort()) === JSON.stringify([...SCHEMA[table]].sort()), "\u041D\u0435\u0432\u0435\u0440\u043D\u044B\u0435 \u043F\u043E\u043B\u044F " + table, "BACKUP");
+      }
+    }
+    assert(p.tables.Users.some((u) => u.role === "admin" && u.status === "active"), "\u0412 \u043A\u043E\u043F\u0438\u0438 \u043D\u0435\u0442 \u0430\u043A\u0442\u0438\u0432\u043D\u043E\u0433\u043E \u0430\u0434\u043C\u0438\u043D\u0438\u0441\u0442\u0440\u0430\u0442\u043E\u0440\u0430", "BACKUP");
+    return p;
+  }
+  function reconcileFiles(tables, inventory, tombstones, historyAvailable, at) {
+    const copy = JSON.parse(JSON.stringify(tables));
+    let unavailable = 0;
+    for (const table of ["Materials", "SubmissionFiles"]) for (const file of copy[table]) {
+      file.delete_pending = false;
+      const actual = inventory.get(file.drive_id);
+      if (file.deleted_at || !historyAvailable || tombstones.has(file.id) || !actual || Number(actual.size) !== file.size) {
+        if (!file.deleted_at) unavailable++;
+        file.deleted_at = file.deleted_at || at;
+      }
+    }
+    for (const s of copy.Submissions) s.files_deleted = !copy.SubmissionFiles.some((f) => f.submission_id === s.id && f.generation === s.generation && !f.deleted_at);
+    return { tables: copy, unavailable };
+  }
+  function createBackups({ repo, store, props, now, uuid, release, createRestoreRepo }) {
+    const event = (action, details = {}) => repo.put("Audit", { id: uuid(), actor_id: "system", action, at: now(), details });
+    const status = () => ({
+      last_success_at: props.getProperty("BACKUP_LAST_SUCCESS_AT"),
+      last_size: Number(props.getProperty("BACKUP_LAST_SIZE") || 0),
+      last_error_at: props.getProperty("BACKUP_LAST_ERROR_AT"),
+      last_error: props.getProperty("BACKUP_LAST_ERROR"),
+      retained: Number(props.getProperty("BACKUP_RETAINED") || 0),
+      keep: Number(props.getProperty("BACKUP_KEEP") || 7),
+      cleanup_pending: Number(props.getProperty("BACKUP_CLEANUP_PENDING") || 0),
+      restore_status: props.getProperty("RESTORE_STATUS")
+    });
+    function create() {
+      const operation = uuid();
+      let leased = false;
+      try {
+        const snapshot = repo.lock(() => {
+          assert(!props.getProperty("BACKUP_LEASE_UNTIL") || props.getProperty("BACKUP_LEASE_UNTIL") <= now(), "\u0420\u0435\u0437\u0435\u0440\u0432\u043D\u0430\u044F \u043A\u043E\u043F\u0438\u044F \u0443\u0436\u0435 \u0441\u043E\u0437\u0434\u0430\u0451\u0442\u0441\u044F", "BUSY");
+          props.setProperty("BACKUP_LEASE_ID", operation);
+          props.setProperty("BACKUP_LEASE_UNTIL", new Date(Date.parse(now()) + 10 * 6e4).toISOString());
+          leased = true;
+          event("backup_started");
+          return makeSnapshot(repo, { id: operation, at: now(), sourceDb: props.getProperty("DB_ID"), storageRoot: props.getProperty("DRIVE_ROOT_ID"), release });
+        });
+        const raw = JSON.stringify(snapshot);
+        const file = store.write(raw, "practicus-metadata-" + snapshot.payload.created_at.replace(/[:.]/g, "-") + "-" + operation + ".json");
+        const stored = JSON.parse(store.read(file.id));
+        validateSnapshot(stored, props.getProperty("DRIVE_ROOT_ID"));
+        assert(stored.sha256 === snapshot.sha256, "Drive \u0432\u0435\u0440\u043D\u0443\u043B \u0434\u0440\u0443\u0433\u0443\u044E \u0440\u0435\u0437\u0435\u0440\u0432\u043D\u0443\u044E \u043A\u043E\u043F\u0438\u044E", "BACKUP");
+        store.commit?.(file.id);
+        const keep = Number(props.getProperty("BACKUP_KEEP") || 7);
+        assert(Number.isInteger(keep) && keep >= 2 && keep <= 30, "BACKUP_KEEP \u0434\u043E\u043B\u0436\u0435\u043D \u0431\u044B\u0442\u044C \u043E\u0442 2 \u0434\u043E 30", "CONFIG");
+        const copies = [file, ...store.list().filter((f) => f.id !== file.id).sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id.localeCompare(a.id))];
+        let pending = 0;
+        for (const old of copies.slice(keep)) try {
+          store.remove(old.id);
+        } catch {
+          pending++;
+        }
+        pending += store.prunePending?.() || 0;
+        props.setProperty("BACKUP_LAST_SUCCESS_AT", now());
+        props.setProperty("BACKUP_LAST_SIZE", String(file.size));
+        props.setProperty("BACKUP_RETAINED", String(Math.min(keep, copies.length) + pending));
+        props.setProperty("BACKUP_CLEANUP_PENDING", String(pending));
+        props.deleteProperty("BACKUP_LAST_ERROR");
+        props.deleteProperty("BACKUP_LAST_ERROR_AT");
+        repo.lock(() => event("backup_completed", { bytes: file.size, retained: Math.min(keep, copies.length) + pending, cleanup_pending: pending }));
+        return { ...status(), cleanup_pending: pending };
+      } catch (error) {
+        if (leased) {
+          props.setProperty("BACKUP_LAST_ERROR_AT", now());
+          props.setProperty("BACKUP_LAST_ERROR", error.code || "INTERNAL");
+        }
+        throw error;
+      } finally {
+        if (leased) repo.lock(() => {
+          if (props.getProperty("BACKUP_LEASE_ID") === operation) {
+            props.deleteProperty("BACKUP_LEASE_ID");
+            props.deleteProperty("BACKUP_LEASE_UNTIL");
+          }
+        });
+      }
+    }
+    function prepareRestore2(id) {
+      assert(props.getProperty("MAINTENANCE_MODE") === "true", "\u041F\u0435\u0440\u0435\u0434 \u0432\u043E\u0441\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435\u043C \u0432\u043A\u043B\u044E\u0447\u0438\u0442\u0435 MAINTENANCE_MODE=true", "MAINTENANCE");
+      const p = validateSnapshot(JSON.parse(store.read(id)), props.getProperty("DRIVE_ROOT_ID"));
+      let tombstones = /* @__PURE__ */ new Set(), historyAvailable = true;
+      try {
+        repo.lock(() => {
+          for (const table of ["Materials", "SubmissionFiles"]) for (const f of repo.all(table)) if (f.deleted_at) tombstones.add(f.id);
+        });
+      } catch {
+        historyAvailable = false;
+      }
+      const reconciled = reconcileFiles(p.tables, store.inventory(), tombstones, historyAvailable, now());
+      props.setProperty("RESTORE_STATUS", "preparing");
+      props.deleteProperty("RESTORED_DB_ID");
+      try {
+        const target = createRestoreRepo();
+        assert(target.id !== props.getProperty("DB_ID"), "\u041D\u0435\u043B\u044C\u0437\u044F \u0432\u043E\u0441\u0441\u0442\u0430\u043D\u0430\u0432\u043B\u0438\u0432\u0430\u0442\u044C \u043F\u043E\u0432\u0435\u0440\u0445 \u0440\u0430\u0431\u043E\u0447\u0435\u0439 \u0431\u0430\u0437\u044B", "BACKUP");
+        for (const table of BACKUP_TABLES) target.repo.writeEmptyTable(table, reconciled.tables[table]);
+        for (const table of BACKUP_TABLES) assert(canonical(target.repo.all(table)) === canonical(reconciled.tables[table]), "\u041F\u0440\u043E\u0432\u0435\u0440\u043A\u0430 \u0432\u043E\u0441\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D\u043D\u043E\u0433\u043E \u043B\u0438\u0441\u0442\u0430 \u043D\u0435 \u043F\u0440\u043E\u0439\u0434\u0435\u043D\u0430: " + table, "BACKUP");
+        for (const table of ["Sessions", "LoginAttempts", "UploadReservations", "UserIntake"]) assert(target.repo.all(table).length === 0, "\u0421\u043B\u0443\u0436\u0435\u0431\u043D\u044B\u0439 \u043B\u0438\u0441\u0442 \u0432\u043E\u0441\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u044F \u043D\u0435 \u043F\u0443\u0441\u0442", "BACKUP");
+        target.complete?.();
+        const report = { prepared_at: now(), snapshot_at: p.created_at, records: BACKUP_TABLES.reduce((n, t) => n + p.tables[t].length, 0), unavailable_files: reconciled.unavailable, deletion_history_available: historyAvailable };
+        props.setProperty("RESTORED_DB_ID", target.id);
+        props.setProperty("RESTORE_REPORT", JSON.stringify(report));
+        props.setProperty("RESTORE_STATUS", "ready");
+        return report;
+      } catch (error) {
+        props.setProperty("RESTORE_STATUS", "failed");
+        throw error;
+      }
+    }
+    return { create, status, prepareRestore: prepareRestore2 };
+  }
+
+  // server/backup-store.js
+  function ensureBackupRoot(props) {
+    let id = props.getProperty("BACKUP_ROOT_ID");
+    if (!id) {
+      id = DriveApp.createFolder("Practicus_Metadata_Backups").getId();
+      props.setProperty("BACKUP_ROOT_ID", id);
+    }
+    return id;
+  }
+  var BackupStore = class {
+    constructor(props, drive) {
+      this.props = props;
+      this.drive = drive;
+      this.checked = false;
+    }
+    folder() {
+      const id = this.props.getProperty("BACKUP_ROOT_ID");
+      assert(id, "\u0417\u0430\u043F\u0443\u0441\u0442\u0438\u0442\u0435 runInitialSetup \u0434\u043B\u044F \u0432\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F \u0440\u0435\u0437\u0435\u0440\u0432\u043D\u044B\u0445 \u043A\u043E\u043F\u0438\u0439", "CONFIG");
+      const folder = DriveApp.getFolderById(id);
+      if (!this.checked) {
+        assert(
+          folder.getOwner()?.getEmail() === Session.getEffectiveUser().getEmail() && folder.getSharingAccess() === DriveApp.Access.PRIVATE && !folder.getEditors().length && !folder.getViewers().length,
+          "\u041F\u0430\u043F\u043A\u0430 \u0440\u0435\u0437\u0435\u0440\u0432\u043D\u044B\u0445 \u043A\u043E\u043F\u0438\u0439 \u0434\u043E\u043B\u0436\u043D\u0430 \u0431\u044B\u0442\u044C \u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0430 \u0442\u043E\u043B\u044C\u043A\u043E \u0432\u044B\u0434\u0435\u043B\u0435\u043D\u043D\u043E\u043C\u0443 \u0430\u043A\u043A\u0430\u0443\u043D\u0442\u0443",
+          "BACKUP"
+        );
+        this.checked = true;
+      }
+      return folder;
+    }
+    write(raw, name2) {
+      const folder = this.folder(), blob = Utilities.newBlob(raw, "application/json", "pending-" + name2);
+      assert(blob.getBytes().length <= MAX_BACKUP_BYTES, "\u0420\u0435\u0437\u0435\u0440\u0432\u043D\u0430\u044F \u043A\u043E\u043F\u0438\u044F \u043F\u0440\u0435\u0432\u044B\u0448\u0430\u0435\u0442 20 \u041C\u0438\u0411", "BACKUP");
+      const file = folder.createFile(blob);
+      return { id: file.getId(), size: file.getSize(), created_at: file.getDateCreated().toISOString() };
+    }
+    file(id) {
+      const folder = this.folder(), file = DriveApp.getFileById(id), parents = file.getParents();
+      let belongs = false;
+      while (parents.hasNext()) if (parents.next().getId() === folder.getId()) belongs = true;
+      assert(
+        belongs && /^(?:pending-)?practicus-metadata-.*\.json$/.test(file.getName()) && file.getSize() <= MAX_BACKUP_BYTES && file.getOwner()?.getEmail() === Session.getEffectiveUser().getEmail() && file.getSharingAccess() === DriveApp.Access.PRIVATE && !file.getEditors().length && !file.getViewers().length,
+        "\u0424\u0430\u0439\u043B \u043D\u0435 \u044F\u0432\u043B\u044F\u0435\u0442\u0441\u044F \u0437\u0430\u043A\u0440\u044B\u0442\u043E\u0439 \u0440\u0435\u0437\u0435\u0440\u0432\u043D\u043E\u0439 \u043A\u043E\u043F\u0438\u0435\u0439 \u044D\u0442\u043E\u0433\u043E \u043F\u0440\u0438\u043B\u043E\u0436\u0435\u043D\u0438\u044F",
+        "BACKUP"
+      );
+      return file;
+    }
+    read(id) {
+      return this.file(id).getBlob().getDataAsString("UTF-8");
+    }
+    commit(id) {
+      const file = this.file(id);
+      assert(file.getName().startsWith("pending-"), "\u041A\u043E\u043F\u0438\u044F \u0443\u0436\u0435 \u0437\u0430\u0444\u0438\u043A\u0441\u0438\u0440\u043E\u0432\u0430\u043D\u0430", "BACKUP");
+      file.setName(file.getName().slice(8));
+    }
+    prunePending() {
+      const files = this.folder().getFiles();
+      let failed = 0;
+      while (files.hasNext()) {
+        const f = files.next();
+        if (f.getName().startsWith("pending-practicus-metadata-") && Date.now() - f.getDateCreated().getTime() > 2 * 864e5) try {
+          this.drive.remove(f.getId());
+        } catch {
+          failed++;
+        }
+      }
+      return failed;
+    }
+    list() {
+      const files = this.folder().getFiles(), result = [];
+      while (files.hasNext()) {
+        const f = files.next();
+        if (/^practicus-metadata-.*\.json$/.test(f.getName())) result.push({ id: f.getId(), size: f.getSize(), created_at: f.getDateCreated().toISOString() });
+      }
+      return result;
+    }
+    remove(id) {
+      this.file(id);
+      this.drive.remove(id);
+    }
+    inventory() {
+      this.drive.check();
+      const root = this.props.getProperty("DRIVE_ROOT_ID");
+      assert(/^[a-zA-Z0-9_-]+$/.test(root), "\u041D\u0435\u0432\u0435\u0440\u043D\u0430\u044F \u043F\u0430\u043F\u043A\u0430 Drive", "CONFIG");
+      const files = /* @__PURE__ */ new Map();
+      let page = "";
+      do {
+        const query = "'" + root + "' in parents and trashed = false";
+        const result = JSON.parse(this.drive.request("drive/v3/files?q=" + encodeURIComponent(query) + "&fields=nextPageToken,files(id,size)&pageSize=1000" + (page ? "&pageToken=" + encodeURIComponent(page) : "")).getContentText());
+        for (const file of result.files || []) files.set(file.id, { size: Number(file.size) });
+        page = result.nextPageToken || "";
+      } while (page);
+      return files;
+    }
+  };
+
   // server/main.js
+  function publicStatus() {
+    return { application: "practicus", version: true ? "1.0.0" : "development", backend_build: true ? "c0cb66d1554f3cff099726e6cbc61021fac2045a3c72484c9cf8a91bafc55501" : "development" };
+  }
   function context() {
     const props = PropertiesService.getScriptProperties();
     const id = props.getProperty("DB_ID");
@@ -1456,7 +1750,19 @@ var Core = (() => {
     const storage = new PrivateDrive(props);
     const limit = Number(props.getProperty("FILE_LIMIT_BYTES") || LIMIT);
     assert(Number.isSafeInteger(limit) && limit > 0 && limit <= LIMIT, "\u041B\u0438\u043C\u0438\u0442 \u0434\u043E\u043B\u0436\u0435\u043D \u0431\u044B\u0442\u044C \u043D\u0435 \u0431\u043E\u043B\u0435\u0435 25 \u041C\u0438\u0411", "CONFIG");
-    return { props, repo, auth, storage, now, uuid, settings: { transportVerified: props.getProperty("FILE_TRANSPORT_VERIFIED") === "true", fileLimit: limit } };
+    const uploadFlag = props.getProperty("FILE_UPLOADS_ENABLED");
+    const ctx = { props, repo, auth, storage, now, uuid, settings: {
+      uploadsEnabled: uploadFlag === null ? props.getProperty("FILE_TRANSPORT_VERIFIED") === "true" : uploadFlag === "true",
+      fileLimit: limit,
+      isMaintenance: () => props.getProperty("MAINTENANCE_MODE") === "true",
+      release: publicStatus()
+    } };
+    ctx.backups = createBackups({ ...ctx, store: new BackupStore(props, storage), release: publicStatus(), createRestoreRepo: () => {
+      const book = SpreadsheetApp.create("Practicus_Restore_INCOMPLETE_" + now().replace(/[:.]/g, "-"));
+      initializeSheets(book.getId());
+      return { id: book.getId(), repo: new SheetRepository(book.getId()), complete: () => book.rename("Practicus_Restore_" + now().replace(/[:.]/g, "-")) };
+    } });
+    return ctx;
   }
   function api(request) {
     try {
@@ -1488,6 +1794,7 @@ var Core = (() => {
     }
     initializeSheets(id);
     ensureStorageRoot(props);
+    ensureBackupRoot(props);
     const ctx = context();
     ctx.storage.check();
     if (!ctx.repo.all("Users").some((u) => u.role === "admin")) {
@@ -1502,10 +1809,22 @@ var Core = (() => {
     }
     const existing = ScriptApp.getProjectTriggers().some((t) => t.getHandlerFunction() === "housekeeping_");
     if (!existing) ScriptApp.newTrigger("housekeeping_").timeBased().everyHours(1).create();
+    if (!ScriptApp.getProjectTriggers().some((t) => t.getHandlerFunction() === "metadataBackup_")) {
+      ScriptApp.newTrigger("metadataBackup_").timeBased().atHour(3).nearMinute(30).everyDays(1).inTimezone("Asia/Irkutsk").create();
+    }
+    if (!props.getProperty("BACKUP_LAST_SUCCESS_AT")) ctx.backups.create();
     return { configured: true };
   }
   function housekeeping() {
     return createService(context()).housekeeping();
+  }
+  function backupMetadata() {
+    return context().backups.create();
+  }
+  function prepareRestore() {
+    const ctx = context(), id = ctx.props.getProperty("RESTORE_BACKUP_ID");
+    assert(id, "\u0417\u0430\u0434\u0430\u0439\u0442\u0435 RESTORE_BACKUP_ID", "CONFIG");
+    return ctx.backups.prepareRestore(id);
   }
   return __toCommonJS(main_exports);
 })();
