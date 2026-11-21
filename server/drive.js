@@ -1,13 +1,22 @@
 import { assert } from './domain.js';
+export function ensureStorageRoot(properties) {
+  let id=properties.getProperty('DRIVE_ROOT_ID');
+  if(!id) {
+    id=DriveApp.createFolder('Practicus_Private_Storage').getId();
+    properties.setProperty('DRIVE_ROOT_ID',id);
+  }
+  return id;
+}
 export class PrivateDrive {
   constructor(properties) { this.props=properties; this.token=null; }
   get(key) { const value=this.props.getProperty(key); assert(value, 'Не настроен '+key, 'CONFIG'); return value; }
   accessToken() {
     if (this.token) return this.token;
-    const response=UrlFetchApp.fetch('https://oauth2.googleapis.com/token',{method:'post',muteHttpExceptions:true,
-      payload:{grant_type:'refresh_token',client_id:this.get('DRIVE_CLIENT_ID'),client_secret:this.get('DRIVE_CLIENT_SECRET'),refresh_token:this.get('DRIVE_REFRESH_TOKEN')}});
-    assert(response.getResponseCode()===200, 'Не удалось авторизовать аккаунт хранилища', 'STORAGE');
-    this.token=JSON.parse(response.getContentText()).access_token; return this.token;
+    // Web App executes as its deployer: the dedicated application's account.
+    // This owner token is used only in server-to-Google requests, never returned.
+    this.token=ScriptApp.getOAuthToken();
+    assert(this.token, 'Подтвердите разрешения Drive в выделенном аккаунте приложения', 'STORAGE');
+    return this.token;
   }
   request(path, options={}) {
     const response=UrlFetchApp.fetch('https://www.googleapis.com/'+path,{...options,muteHttpExceptions:true,
@@ -18,7 +27,7 @@ export class PrivateDrive {
   check() {
     const account=JSON.parse(this.request('drive/v3/about?fields=user,storageQuota').getContentText());
     const root=JSON.parse(this.request('drive/v3/files/'+encodeURIComponent(this.get('DRIVE_ROOT_ID'))+'?fields=id,mimeType,ownedByMe,trashed,permissions(type,role)').getContentText());
-    assert(root.ownedByMe && !root.trashed && root.mimeType==='application/vnd.google-apps.folder', 'Корневая папка должна принадлежать аккаунту хранилища', 'CONFIG');
+    assert(root.ownedByMe && !root.trashed && root.mimeType==='application/vnd.google-apps.folder', 'Корневая папка должна принадлежать аккаунту, развернувшему Apps Script', 'CONFIG');
     assert(!root.permissions?.some(p=>['anyone','domain'].includes(p.type)), 'Уберите публичный доступ к папке хранилища', 'CONFIG');
     return {storageQuota:account.storageQuota,owner:account.user.emailAddress};
   }

@@ -1,6 +1,6 @@
 import { SheetRepository, initializeSheets } from './repository.js';
 import { Auth } from './auth.js';
-import { PrivateDrive } from './drive.js';
+import { PrivateDrive, ensureStorageRoot } from './drive.js';
 import { createService } from './service.js';
 import { assert, LIMIT } from './domain.js';
 function context() {
@@ -34,7 +34,9 @@ export function setup() {
   let id=props.getProperty('DB_ID');
   if(!id) {id=SpreadsheetApp.create('Practicus_DB').getId(); props.setProperty('DB_ID',id);}
   initializeSheets(id);
+  ensureStorageRoot(props);
   const ctx=context();
+  ctx.storage.check();
   if(!ctx.repo.all('Users').some(u=>u.role==='admin')) {
     const login=props.getProperty('INIT_ADMIN_LOGIN'),password=props.getProperty('INIT_ADMIN_PASSWORD');
     assert(login && password,'Задайте INIT_ADMIN_LOGIN и INIT_ADMIN_PASSWORD','CONFIG');
