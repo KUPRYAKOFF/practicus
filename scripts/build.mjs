@@ -1,0 +1,10 @@
+import { build } from 'esbuild';
+import { mkdir,cp,writeFile,readFile } from 'node:fs/promises';
+await mkdir('dist',{recursive:true});
+await cp('web','dist/site',{recursive:true});
+await cp('apps-script','dist/apps-script',{recursive:true});
+const result=await build({entryPoints:['server/main.js'],bundle:true,format:'iife',globalName:'Core',target:'es2020',platform:'neutral',write:false});
+const notices=await readFile('THIRD_PARTY_NOTICES.txt','utf8');
+await writeFile('dist/apps-script/Core.gs','/*\n'+notices+'\n*/\n'+result.outputFiles[0].text);
+await writeFile('dist/apps-script/.claspignore','**/node_modules/**\n');
+console.log('Built GitHub Pages → dist/site; Apps Script → dist/apps-script');

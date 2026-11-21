@@ -1,0 +1,33 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body>
+<script>
+'use strict';
+const allowedOrigin = <?!= JSON.stringify(origin) ?>;
+const channel = <?!= JSON.stringify(channel) ?>;
+const send = data => window.top.postMessage({...data,channel},allowedOrigin);
+const pending=new Set();
+window.addEventListener('message',event=>{
+  if(event.origin!==allowedOrigin || event.source!==window.top || event.data?.channel!==channel) return;
+  const message=event.data;
+  if(!['rpc','upload'].includes(message.type) || typeof message.id!=='string' || pending.has(message.id)) return;
+  pending.add(message.id);
+  let form;
+  const finish=result=>{pending.delete(message.id);form?.remove();send({type:'response',id:message.id,result});};
+  const failure=()=>finish({ok:false,error:{code:'TRANSPORT',message:'Соединение с Apps Script прервано. Проверьте состояние операции.'}});
+  if(message.type==='rpc') google.script.run.withSuccessHandler(finish).withFailureHandler(failure).api(message.request);
+  else {
+    try {
+      if(!Array.isArray(message.files) || message.files.length>25 || message.files.length<1) throw new Error('files');
+      form=document.createElement('form'); form.hidden=true;
+      const field=(key,value)=>{const input=document.createElement('input');input.name=key;input.value=value;form.append(input);};
+      field('token',message.token);field('reservation_id',message.reservation_id);field('count',message.files.length);
+      message.files.forEach((file,i)=>{
+        const input=document.createElement('input');input.type='file';input.name='file_'+i;
+        const transfer=new DataTransfer();transfer.items.add(file);input.files=transfer.files;form.append(input);
+      });
+      document.body.append(form);
+      google.script.run.withSuccessHandler(finish).withFailureHandler(failure).uploadForm(form);
+    } catch {failure();}
+  }
+});
+send({type:'ready'});
+</script></body></html>
